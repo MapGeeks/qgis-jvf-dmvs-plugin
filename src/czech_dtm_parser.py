@@ -144,6 +144,9 @@ class CzechDTMParser:
                     logger.error(f"Chyba při zpracování elementu: {e}")
                     continue
 
+            # Zoomovani na data
+            self._zoom_to_data()
+
             return True, "Data byla úspěšně načtena"
 
         except Exception as e:
@@ -720,3 +723,73 @@ class CzechDTMParser:
             self.iface.messageBar().pushSuccess("DTM Parser", message)
         else:
             self.iface.messageBar().pushWarning("DTM Parser", message)
+
+    def _zoom_to_data(self):
+        """
+        Funkce pro zoom na data - centruje mapu na všechna načtená data
+        a nastavuje měřítko podle největšího rozsahu z rendererů.
+        """
+        from PyQt5.QtCore import QTimer
+
+        def do_zoom():
+            # Získáme všechny vektorové vrstvy
+            layers = [
+                layer
+                for layer in QgsProject.instance().mapLayers().values()
+                if isinstance(layer, QgsVectorLayer)
+                and layer.isValid()
+                and layer.featureCount() > 0
+            ]
+
+            if not layers:
+                return  # Nemáme žádná data
+
+            # Vytvoříme kombinovaný extent všech vrstev
+            combined_extent = None
+
+            # Najdeme největší měřítko z rendererů všech vrstev
+            largest_scale = 0
+
+            for layer in layers:
+                # Aktualizujeme extent
+                if combined_extent is None:
+                    combined_extent = layer.extent()
+                else:
+                    combined_extent.combineExtentWith(layer.extent())
+
+                # Zkontrolujeme renderer
+                renderer = layer.renderer()
+                if isinstance(renderer, QgsRuleBasedRenderer):
+                    # Procházíme pravidla rendereru
+                    root_rule = renderer.rootRule()
+                    for child_rule in root_rule.children():
+                        # Největší minimumScale() hodnota určuje nejmenší detailní měřítko
+                        if child_rule.minimumScale() > largest_scale:
+                            largest_scale = child_rule.minimumScale()
+
+            if combined_extent is None or combined_extent.isNull():
+                return  # Nemáme platný extent
+
+            # Rozšíříme extent o 10% pro lepší vizualizaci
+            combined_extent.grow(0.1)
+
+            # Nastavíme pohled
+            canvas = self.iface.mapCanvas()
+            canvas.setExtent(combined_extent)
+
+            # Použijeme největší nalezené měřítko, nebo výchozí hodnotu
+            if largest_scale == 0:
+                # Použijeme hodnotu z posledního rozsahu v SCALE_RANGES
+                largest_scale = SCALE_RANGES["25000"].max_scale
+
+            # Přidáme trochu rezervu, aby bylo měřítko o něco větší
+            # a zajistilo zobrazení dat
+            target_scale = largest_scale * 0.99
+
+            canvas.zoomScale(target_scale)
+            canvas.refresh()
+
+            # print(f"Zoom was completed successfully to scale 1:{target_scale}")
+
+        # Použijeme delší zpoždění pro jistotu
+        QTimer.singleShot(500, do_zoom)

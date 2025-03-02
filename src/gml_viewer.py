@@ -22,7 +22,7 @@ from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtCore import QSettings, QTranslator, QCoreApplication
 
 from .czech_dtm_parser import CzechDTMParser
-
+from .dxf import export_layers_to_dxf
 
 class GMLViewer:
     """QGIS Plugin Implementation."""
@@ -111,6 +111,15 @@ class GMLViewer:
             callback=self.run,
             parent=self.iface.mainWindow(),
         )
+        
+        icon_path_dxf = self.plugin_dir / "../icons/iconOut.png"
+        self.add_action(
+            icon_path_dxf,
+            text="JVF DTM Viewer - export to DXF",
+            callback=self.run_dxf,
+            parent=self.iface.mainWindow(),
+        )
+            
         self.first_start = True
 
     def unload(self):
@@ -121,12 +130,30 @@ class GMLViewer:
         self.actions.clear()
 
     def run(self) -> None:
-        """Run method that performs all the real work."""
+        """
+        Run method that performs all the real work.
+        Zpracování probíhá asynchronně v samostatném vlákně.
+        """
         filename, _ = QFileDialog.getOpenFileName(
             None, "Select JVF File", "", "JVF files XML files (*.xml);;All files (*.*)"
         )
         if not filename:
             return
 
-        success, message = self.parser.parse_file(filename)
-        self._show_message_box(message, success)
+        # Spustíme parsování ve vlákně a pokračujeme dál
+        # Zpětná vazba uživateli bude poskytnuta přes QgsMessageBar
+        self.parser.parse_file(filename)
+        
+        # Zde už se nevypisuje žádná zpráva - zpětná vazba je zajištěna v DTMParserTask.finished
+
+    def run_dxf(self) -> None:
+        """Run method that performs export to DXF"""
+        filename, _ = QFileDialog.getSaveFileName(
+            None, "Select DXF File", "", "DXF (*.dxf);;All files (*.*)"
+        )
+        if not filename:
+            return
+        if filename.lower().endswith('.dxf'):
+            filename = filename[:-4]
+        export_layers_to_dxf(filename, None, 500)
+

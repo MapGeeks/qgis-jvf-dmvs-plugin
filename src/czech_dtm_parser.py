@@ -30,8 +30,8 @@ from qgis.core import (
     QgsFeature,
     QgsGeometry,
     QgsProject,
-    QgsLayerTreeGroup,
     QgsRuleBasedRenderer,
+    QgsApplication
 )
 
 from .style_manager import StyleManager
@@ -40,6 +40,11 @@ from .attribute_processor import AttributeProcessor
 from .batch_processor import BatchFeatureProcessor
 from .symbol_processor import SymbolProcessor
 from .helpers import load_type_mapping
+from .dtm_parser_task import DTMParserTask
+
+
+
+
 
 logger = logging.getLogger(__name__)
 
@@ -109,46 +114,146 @@ class CzechDTMParser:
 
         # Načtení konfigurace
         self.type_mapping_df = load_type_mapping()
+        
+        # Dočasné úložiště pro vrstvy a skupiny
+        self.temp_tree_structure = {}
+        self.temp_layers = []
+        self.root_groups = {}
+
 
     def parse_file(self, filename: str) -> Tuple[bool, str]:
         """
-        Hlavní metoda pro parsování DTM souboru.
-
-        Args:
-            filename: Cesta k souboru pro zpracování
-
-        Returns:
-            Tuple[bool, str]: (úspěch, zpráva)
+        Hlavní metoda pro parsování DTM souboru - používá neblokující přístup.
         """
-        try:
-            # Načtení stylů pokud ještě nejsou
-            if not self.style_manager.initialized:
-                self.style_manager.load_styles()
+        from PyQt5.QtCore import QEventLoop, QTimer
+        
+        
+        # Resetujeme struktury
+        self.temp_tree_structure = {}
+        self.temp_layers = []
+        self.root_groups = {}
+        
+        # Informace pro uživatele
+        self.iface.messageBar().pushInfo("DTM Parser", "Načítání dat zahájeno...")
+        
+        # Vytvoříme event loop, který bude "čekat" na dokončení úlohy
+        loop = QEventLoop()
+        
+        # Vytvoříme a spustíme úlohu
+        task = DTMParserTask("Parsování DTM dat", self, filename, NAMESPACES)
+        
+        # Připojíme výsledek úlohy k ukončení event loop
+        task.taskCompleted.connect(loop.quit)
+        
+        # Přidáme úlohu do správce úloh
+        QgsApplication.taskManager().addTask(task)
+        
+        # "Čekáme" na dokončení úlohy - ale ve skutečnosti necháváme Qt zpracovávat události
+        # To znamená, že UI zůstává responzivní
+        loop.exec_()
+        
+        # Nyní je úloha dokončena, můžeme finalizovat vrstvy v hlavním vlákně
+        if hasattr(task, 'success') and task.success:
+            try:
+                # Finalizace projektu
+                self._finalize_project_tree()
+                self._zoom_to_data()
+                self.iface.messageBar().pushSuccess("DTM Parser", "Data byla úspěšně načtena")
+            except Exception as e:
+                logger.error(f"Chyba při finalizaci dat: {e}", exc_info=True)
+                self.iface.messageBar().pushWarning("DTM Parser", f"Chyba: {str(e)}")
+        else:
+            message = getattr(task, 'message', "Neznámá chyba")
+            self.iface.messageBar().pushWarning("DTM Parser", message)
+        
+        return True, "Zpracování dokončeno"
 
-            # Parsování XML pomocí iterparse pro efektivní zpracování velkých souborů
-            context = ET.iterparse(
-                filename, events=("end",), tag=f'{{{NAMESPACES["objtyp"]}}}DataJVFDTM'
-            )
-
-            for event, elem in context:
-                try:
-                    # Zpracování datového elementu
-                    processed_count = self._process_data_element(elem)
-
-                    # Vyčištění paměti
-                    elem.clear()
-                    while elem.getprevious() is not None:
-                        del elem.getparent()[0]
-
-                except Exception as e:
-                    logger.error(f"Chyba při zpracování elementu: {e}")
-                    continue
-
-            return True, "Data byla úspěšně načtena"
-
-        except Exception as e:
-            logger.error(f"Chyba při parsování souboru: {e}", exc_info=True)
-            return False, f"Chyba při parsování: {str(e)}"
+    
+    def _finalize_project_tree(self):
+        """
+        Hromadně přidá všechny vrstvy do projektu a struktury skupin.
+        Tato metoda musí běžet v hlavním vlákně.
+        """
+        from PyQt5.QtCore import QCoreApplication
+        
+        project = QgsProject.instance()
+        root = project.layerTreeRoot()
+        
+        # Pro jistotu zpracujeme události aplikace
+        QCoreApplication.processEvents()
+        
+        # Nejprve vytvoříme celou strukturu skupin
+        for group_path, group_name in self.temp_tree_structure.items():
+            QCoreApplication.processEvents()  # Zpracování UI událostí
+            self._ensure_group_path(group_path, group_name)
+        
+        # Pak přidáme vrstvy do projektu
+        layers_to_add = []
+        for layer, parent_path, visible in self.temp_layers:
+            if layer and layer.isValid():
+                layers_to_add.append((layer, False))  # False = nepřidat do legendy
+        
+        # Hromadné přidání vrstev do projektu
+        project.addMapLayers([layer for layer, _ in layers_to_add], False)
+        
+        # Zpracujeme UI události
+        QCoreApplication.processEvents()
+        
+        # Přidání vrstev do skupin
+        for i, (layer, parent_path, visible) in enumerate(self.temp_layers):
+            if i % 10 == 0:  # Každých 10 vrstev zpracovat události UI
+                QCoreApplication.processEvents()
+                
+            if not layer or not layer.isValid():
+                continue
+                
+            parent_group = self._get_group_by_path(parent_path)
+            if parent_group:
+                layer_node = parent_group.addLayer(layer)
+                if layer_node:
+                    layer_node.setItemVisibilityChecked(visible)
+        
+        # Nakonec refresh
+        self.iface.mapCanvas().refresh()
+        QCoreApplication.processEvents()
+    
+    def _ensure_group_path(self, path, name):
+        """
+        Zajistí, že existuje cesta ke skupině ve stromě.
+        
+        Args:
+            path: Cesta ke skupině ve formátu 'obsah/kategorie/skupina'
+            name: Název skupiny
+        """
+        parts = path.split('/')
+        current_path = ""
+        parent = QgsProject.instance().layerTreeRoot()
+        
+        for i, part in enumerate(parts):
+            if not current_path:
+                current_path = part
+            else:
+                current_path += f"/{part}"
+            
+            if current_path in self.root_groups:
+                parent = self.root_groups[current_path]
+            else:
+                # Vytvoříme novou skupinu
+                new_group = self.create_group(part, parent)
+                self.root_groups[current_path] = new_group
+                parent = new_group
+    
+    def _get_group_by_path(self, path):
+        """
+        Získá skupinu podle cesty.
+        
+        Args:
+            path: Cesta ke skupině ve formátu 'obsah/kategorie/skupina'
+            
+        Returns:
+            QgsLayerTreeGroup: Instance skupiny nebo None
+        """
+        return self.root_groups.get(path)
 
     def _process_data_element(self, root_elem: ET.Element) -> int:
         """Zpracování hlavního datového elementu"""
@@ -192,13 +297,67 @@ class CzechDTMParser:
 
         return self._process_records(records, obj_type, code_num, config_type, groups)
 
+
+    def create_group(self, group_name: str, parent=None):
+        """
+        Vytvoří novou skupinu v daném rodičovském elementu.
+        
+        Args:
+            group_name: Název skupiny
+            parent: Rodičovský element (výchozí je kořen projektu)
+            
+        Returns:
+            QgsLayerTreeGroup: Nová nebo existující skupina
+        """
+        if parent is None:
+            parent = QgsProject.instance().layerTreeRoot()
+
+        existing_group = parent.findGroup(group_name)
+        if existing_group:
+            return existing_group
+
+        return parent.addGroup(group_name)
+
+
+    def _create_group_structure(self, data_obj):
+        """
+        Vytvoří strukturu skupin a uloží je do dočasné struktury.
+        
+        Returns:
+            Dict: Slovník s cestami ke skupinám
+        """
+        obsahova_cast = data_obj.find("x:ObsahovaCast", NAMESPACES).text
+        kategorie = data_obj.find("x:KategorieObjektu", NAMESPACES).text
+        skupina = data_obj.find("x:SkupinaObjektu", NAMESPACES).text
+        
+        # Vytvoříme cesty k jednotlivým úrovním skupin
+        obsah_path = obsahova_cast
+        kategorie_path = f"{obsah_path}/{kategorie}"
+        skupina_path = f"{kategorie_path}/{skupina}"
+        
+        # Přidáme do dočasné struktury, pokud tam ještě nejsou
+        if obsah_path not in self.temp_tree_structure:
+            self.temp_tree_structure[obsah_path] = obsahova_cast
+        
+        if kategorie_path not in self.temp_tree_structure:
+            self.temp_tree_structure[kategorie_path] = kategorie
+        
+        if skupina_path not in self.temp_tree_structure:
+            self.temp_tree_structure[skupina_path] = skupina
+        
+        return {
+            "obsah": obsah_path,
+            "kategorie": kategorie_path,
+            "skupina": skupina_path,
+        }
+
     def _process_records(
         self,
         records: List[ET.Element],
         obj_type: ET.Element,
         code_num: str,
         config_type: str,
-        groups: Dict[str, QgsLayerTreeGroup],
+        groups: Dict[str, str]
     ) -> int:
         """Zpracování záznamů objektů"""
         type_features = defaultdict(
@@ -240,27 +399,32 @@ class CzechDTMParser:
         type_features: dict,
     ) -> int:
         """Zpracování jednotlivého záznamu"""
-        # Získání typu a atributů
-
-        attributes = record.find("x:AtributyObjektu", NAMESPACES)
-        record_type, tag_name = self._determine_record_type(
-            attributes, code_num, obj_type.text
-        )
-
-        # Zpracování geometrií
-        geom_list = list(
-            self.geom_processor.process_geometries(
-                record.find("x:GeometrieObjektu", NAMESPACES)
+        try:
+            # Získání typu a atributů
+            attributes = record.find("x:AtributyObjektu", NAMESPACES)
+            record_type, tag_name = self._determine_record_type(
+                attributes, code_num, obj_type.text
             )
-        )
 
-        if not geom_list:
+            # Zpracování geometrií
+            geom_list = list(
+                self.geom_processor.process_geometries(
+                    record.find("x:GeometrieObjektu", NAMESPACES)
+                )
+            )
+
+            if not geom_list:
+                return 0
+
+            # Uložení dat do type_features
+            return self._store_geometries(
+                geom_list, record, record_type, tag_name, type_features
+            )
+        except Exception as e:
+            print(f"Detailní chyba při zpracování záznamu: {str(e)}")
+            import traceback
+            traceback.print_exc()  # Toto vytiskne celý stack trace
             return 0
-
-        # Uložení dat do type_features
-        return self._store_geometries(
-            geom_list, record, record_type, tag_name, type_features
-        )
 
     def _determine_record_type(
         self, attributes: ET.Element, code_num: str, obj_type_text: str
@@ -294,6 +458,82 @@ class CzechDTMParser:
 
         return record_type, tag_name
 
+    def _on_processing_finished(self, progress_dialog, success, message):
+        """Handler for processing completion"""
+        progress_dialog.close()
+        if success:
+            self.iface.messageBar().pushSuccess("DTM Parser", message)
+        else:
+            self.iface.messageBar().pushWarning("DTM Parser", message)
+
+
+    def _zoom_to_data(self):
+        """
+        Funkce pro zoom na data - centruje mapu na všechna načtená data
+        a nastavuje měřítko podle největšího rozsahu z rendererů.
+        """
+        from PyQt5.QtCore import QTimer
+        
+        def do_zoom():
+            # Získáme všechny vektorové vrstvy
+            layers = [layer for layer in QgsProject.instance().mapLayers().values() 
+                    if isinstance(layer, QgsVectorLayer) and layer.isValid() and layer.featureCount() > 0]
+            
+            if not layers:
+                return  # Nemáme žádná data
+            
+            # Vytvoříme kombinovaný extent všech vrstev
+            combined_extent = None
+            
+            # Najdeme největší měřítko z rendererů všech vrstev
+            largest_scale = 0
+            
+            for layer in layers:
+                # Aktualizujeme extent
+                if combined_extent is None:
+                    combined_extent = layer.extent()
+                else:
+                    combined_extent.combineExtentWith(layer.extent())
+                
+                # Zkontrolujeme renderer
+                renderer = layer.renderer()
+                if isinstance(renderer, QgsRuleBasedRenderer):
+                    # Procházíme pravidla rendereru
+                    root_rule = renderer.rootRule()
+                    for child_rule in root_rule.children():
+                        # Největší minimumScale() hodnota určuje nejmenší detailní měřítko
+                        if child_rule.minimumScale() > largest_scale:
+                            largest_scale = child_rule.minimumScale()
+            
+            if combined_extent is None or combined_extent.isNull():
+                return  # Nemáme platný extent
+            
+            # Rozšíříme extent o 10% pro lepší vizualizaci
+            combined_extent.grow(0.1)
+            
+            # Nastavíme pohled
+            canvas = self.iface.mapCanvas()
+            canvas.setExtent(combined_extent)
+            
+            # Použijeme největší nalezené měřítko, nebo výchozí hodnotu
+            if largest_scale == 0:
+                # Použijeme hodnotu z posledního rozsahu v SCALE_RANGES
+                largest_scale = SCALE_RANGES["25000"].max_scale
+            
+            # Přidáme trochu rezervu, aby bylo měřítko o něco větší
+            # a zajistilo zobrazení dat
+            target_scale = largest_scale * 0.99
+            
+            canvas.zoomScale(target_scale)
+            canvas.refresh()
+            
+            #print(f"Zoom was completed successfully to scale 1:{target_scale}")
+        
+        # Použijeme delší zpoždění pro jistotu
+        QTimer.singleShot(500, do_zoom)
+
+
+
     def _store_geometries(
         self,
         geom_list: List[Tuple[QgsGeometry, str, str]],
@@ -314,7 +554,7 @@ class CzechDTMParser:
             )
 
             features_dict = type_features[type_key]
-            if not features_dict["first_element"]:
+            if  features_dict["first_element"] is None:
                 features_dict.update(
                     {
                         "first_element": record,
@@ -341,7 +581,7 @@ class CzechDTMParser:
             )
 
             features_dict = type_features[type_key]
-            if not features_dict["first_element"]:
+            if features_dict["first_element"] is None:
                 features_dict.update(
                     {
                         "first_element": record,
@@ -362,7 +602,7 @@ class CzechDTMParser:
         type_features: dict,
         obj_type: ET.Element,
         config_type: str,
-        groups: Dict[str, QgsLayerTreeGroup],
+        groups: Dict[str, str]
     ):
         """Vytvoření vrstev pro všechny typy"""
         # print(f"\nCreating layers for {len(type_features)} types")
@@ -390,7 +630,7 @@ class CzechDTMParser:
         data: dict,
         obj_type: ET.Element,
         config_type: str,
-        groups: Dict[str, QgsLayerTreeGroup],
+        groups: Dict[str, str]
     ):
         """
         Vytvoření vrstev pro konkrétní typ.
@@ -501,49 +741,29 @@ class CzechDTMParser:
         second_geom_layer: QgsVectorLayer,
         scale_layer: QgsVectorLayer,
         base_name: str,
-        groups: Dict[str, QgsLayerTreeGroup],
+        groups: Dict[str, str]
     ):
         """
-        Přidání vrstev do skupin.
+        Přidání vrstev do dočasné struktury.
         """
-        # Pokud jsme ve skupině ZPS, nepřidávat další podskupinu ZPS
-        parent_group = groups["skupina"]
-
+        # Získáme cestu k rodičovské skupině
+        parent_path = groups["skupina"]
+        
+        if parent_path not in self.temp_tree_structure:
+            logger.error(f"Skupina s cestou {parent_path} není v temp_tree_structure")
+        
         if second_geom_layer:
-            QgsProject.instance().addMapLayer(second_geom_layer, False)
-            tree_layer = parent_group.addLayer(second_geom_layer)
-            tree_layer.setItemVisibilityChecked(False)
+            if second_geom_layer.featureCount() > 0:
+                self.temp_layers.append((second_geom_layer, parent_path, False))
+            else:
+                logger.warning(f"Druhá geometrická vrstva {second_geom_layer.name()} nemá žádné prvky - nebude přidána")
 
-        QgsProject.instance().addMapLayer(scale_layer, False)
-        parent_group.addLayer(scale_layer)
-
-    def create_group(self, group_name: str, parent=None):
-        if parent is None:
-            parent = QgsProject.instance().layerTreeRoot()
-
-        existing_group = parent.findGroup(group_name)
-        if existing_group:
-            return existing_group
-
-        return parent.addGroup(group_name)
-
-    def _create_group_structure(self, data_obj):
-        root = QgsProject.instance().layerTreeRoot()
-
-        obsahova_cast = data_obj.find("x:ObsahovaCast", NAMESPACES).text
-        kategorie = data_obj.find("x:KategorieObjektu", NAMESPACES).text
-        skupina = data_obj.find("x:SkupinaObjektu", NAMESPACES).text
-
-        obsahova_group = self.create_group(obsahova_cast, root)
-        kategorie_group = self.create_group(kategorie, obsahova_group)
-        skupina_group = self.create_group(skupina, kategorie_group)
-
-        return {
-            "obsah": obsahova_group,
-            "kategorie": kategorie_group,
-            "skupina": skupina_group,
-        }
-
+        if scale_layer:
+            if scale_layer.featureCount() > 0:
+                self.temp_layers.append((scale_layer, parent_path, True))
+            else:
+                logger.warning(f"Hlavní vrstva {scale_layer.name()} nemá žádné prvky - nebude přidána")
+                
     def _get_layer_name(
         self, obj_type: ET.Element, tag_name: Optional[str], type_value: Optional[str]
     ) -> str:
@@ -593,7 +813,7 @@ class CzechDTMParser:
             return f"{base_name} - {default_type}"
 
         return f"{base_name}"
-
+    
     def _create_scale_based_renderer(
         self, layer: QgsVectorLayer, base_layer_name: str, base_layer_name2: str
     ) -> QgsRuleBasedRenderer:
@@ -712,11 +932,3 @@ class CzechDTMParser:
 
         # print(f"Created renderer with {len(rules)} rules")
         return renderer
-
-    def _on_processing_finished(self, progress_dialog, success, message):
-        """Handler for processing completion"""
-        progress_dialog.close()
-        if success:
-            self.iface.messageBar().pushSuccess("DTM Parser", message)
-        else:
-            self.iface.messageBar().pushWarning("DTM Parser", message)
